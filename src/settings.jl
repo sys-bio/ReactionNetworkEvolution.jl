@@ -35,6 +35,7 @@ struct Settings
     p_new_rateconstant::Float64 # Probability of picking new rate constant during mutation vs slight change
     population_size::Int
     ngenerations::Int
+    nspecies::Int
     nreactions::Int
     max_offspring_portion::Float64 # The maximum portion of offspring a single species can have
     writeout_threshold::Float64 # Networks with this fitness or better will be saved
@@ -56,7 +57,7 @@ struct Settings
     objective_data_path::String
     match_objectivefunction_species::Bool
     enable_speciation::Bool
-    track_metadata::Bool
+    track_fitness::Bool
     #objectivespecies::Vector{String}
     average_fitness::Bool
     same_fitness_crossover::Bool
@@ -82,6 +83,7 @@ function rowtovec(df::DataFrame, row::Int)
 end
 
 function get_objectivefunction(path::String)
+    # If the user supplies a path for the objective timeseries, read it and get the chemical names from it
     if path != "DEFAULT"
         objectivedataframe = DataFrame(File(path))
         time = objectivedataframe[!, 1]
@@ -90,10 +92,11 @@ function get_objectivefunction(path::String)
         initial_concentrations = rowtovec(objectivedata, 1)
         objectivedata = Matrix(objectivedata)
     else
+    # If no path is supplied, use the default oscillator time points
         time = collect(range(0, 1.25, length=11))
         objectivedata = [5.0, 30.0, 5.0, 30.0, 5.0, 30.0, 5.0, 30.0, 5.0, 30.0, 5.0]
-        chemical_species_names = ["S0", "S1", "S2"]
-        initial_concentrations = [0., 0., 0.]
+        chemical_species_names = [""]
+        initial_concentrations = [0.]
     end
     return ObjectiveFunction(objectivedata, time), chemical_species_names, initial_concentrations
 end
@@ -109,6 +112,7 @@ function read_usersettings(settings_dict::Dict{String, Any})
         "p_new_rateconstant" => 0.15,
         "population_size" => 100,
         "ngenerations" => 800,
+        "nspecies" => 3,
         "nreactions" => 5,
         "max_offspring_portion" => 0.1,
         "writeout_threshold" => 0.05,
@@ -130,12 +134,12 @@ function read_usersettings(settings_dict::Dict{String, Any})
         "objective_data_path" => "DEFAULT",
         "match_objectivefunction_species" => true,
         "enable_speciation" => true,
-        "track_metadata" => true,
+        "track_fitness" => true,
         "average_fitness" => false,
         "same_fitness_crossover" => false,
         "same_fitness_percent_range" => 5,
         "lenient_crossover" => false,
-        "process_output_oscillators" => true,
+        "process_output_oscillators" => false,
         "verbose" => true,
         "note"=>""
         )
@@ -159,6 +163,7 @@ function read_usersettings(settings_dict::Dict{String, Any})
                 settings["p_new_rateconstant"],
                 settings["population_size"],
                 settings["ngenerations"],
+                settings["nspecies"],
                 settings["nreactions"],
                 settings["max_offspring_portion"],
                 settings["writeout_threshold"],
@@ -180,7 +185,7 @@ function read_usersettings(settings_dict::Dict{String, Any})
                 settings["objective_data_path"],
                 settings["match_objectivefunction_species"],
                 settings["enable_speciation"],
-                settings["track_metadata"],
+                settings["track_fitness"],
                 settings["average_fitness"],
                 settings["same_fitness_crossover"],
                 settings["same_fitness_percent_range"],
@@ -193,7 +198,7 @@ function read_usersettings(settings_dict::Dict{String, Any})
 end
 
 
-function read_usersettings(path::String; ngenerations::Int64=-1, population_size::Int64=-1, seed::Int64=-1, note::String="")
+function read_usersettings(path::String; ngenerations::Int64=-1, nspecies::Int64=3, initial_concentrations::Vector{Float64}=[1., 5., 9.], population_size::Int64=-1, seed::Int64=-1, note::String="")
     settings = Dict(
         "portion_elite" => 0.1,
         "reaction_probabilities" => [.1, .4, .4, .1],
@@ -203,6 +208,7 @@ function read_usersettings(path::String; ngenerations::Int64=-1, population_size
         "p_new_rateconstant" => 0.15,
         "population_size" => 100,
         "ngenerations" => 800,
+        "nspecies" => 3,
         "nreactions" => 5,
         "max_offspring_portion" => 0.1,
         "writeout_threshold" => 0.05,
@@ -224,18 +230,26 @@ function read_usersettings(path::String; ngenerations::Int64=-1, population_size
         "objective_data_path" => "DEFAULT",
         "match_objectivefunction_species" => true,
         "enable_speciation" => true,
-        "track_metadata" => true,
+        "track_fitness" => true,
         "average_fitness" => false,
         "same_fitness_crossover" => false,
         "same_fitness_percent_range" => 5,
         "lenient_crossover" => false,
-        "process_output_oscillators" => true,
+        "process_output_oscillators" => false,
         "verbose" => true,
         "note"=>""
         )
 
     # Get the package directory
-    package_dir = dirname(dirname(pathof(ReactionNetworkEvolution)))
+    package_dir = ""
+    try
+        # If using it as a package, ie location is in the julia folder
+        package_dir = dirname(dirname(pathof(ReactionNetworkEvolution)))
+    catch
+        # Otherwise it's probably being run from a separate ReactionNetworkEvolution.jl directory
+        package_dir = pwd()
+    end
+
     use_settings_json = false
     # If theres a settings.json file there AND no other settings file is supplied, read it
     if isfile(joinpath(package_dir, "settings.json")) && path == :"DEFAULT"
@@ -290,25 +304,34 @@ function read_usersettings(path::String; ngenerations::Int64=-1, population_size
     # Set the random seed
     Random.seed!(Int64(seed))
 
+    # Check if nspecies is supplied and update it if not default value
+    # Check if the number of species names match the number of species, if not, generate them
+    if nspecies != 3
+        settings["nspecies"] = 3
+        if length(settings["chemical_species_names"]) != nspecies
+            settings["chemical_species_names"] = generate_chemical_species_names(nspecies)
+        end
+        settings["initial_concentrations"] = initial_concentrations
+        if length(settings["initial_concentrations"]) != nspecies
+            error("number of initial conditions does not match number of chemical species")
+        end
+    end
+
     # Check if the user has supplied a note
     if note != ""
         settings["note"] = note
     end
 
-    # # Check probability values
-    # if settings["exclusive_crossover_mutation"] && (settings["p_crossover"] + settings["p_mutation"] > 1)
-    #     error("p_crossover + p_mutation must be less than or equal to 1")
-    # end
-    # if sum(settings["reaction_probabilities"]) != 1
-    #     error("reaction_probabilities must sum to 1")
-    # end
 
     # Get the objective function and species IDs 
     objectivefunction, floatingspeciesIDs, initial_concentrations = get_objectivefunction(settings["objective_data_path"])
-    settings["chemical_species_names"] = floatingspeciesIDs
+    if floatingspeciesIDs != [""]
+        # If using user defined objective data, get the chemical species names from there
+        settings["chemical_species_names"] = floatingspeciesIDs
+    end
     # If the initial conditions were read from the objective data, them put them in the settings, dict.
-    # If the intital conditions are returend as [0., 0., 0.], then use either default or user-supplied
-    if initial_concentrations != [0., 0., 0.,] 
+    # If the intital conditions are returned as [0.], then use either default or user-supplied
+    if initial_concentrations != [0.] 
         settings["initial_concentrations"] = initial_concentrations
     end
     if length(initial_concentrations) != length(floatingspeciesIDs)
@@ -333,6 +356,7 @@ function read_usersettings(path::String; ngenerations::Int64=-1, population_size
                    settings["p_new_rateconstant"],
                    population_size,
                    ngenerations,
+                   settings["nspecies"],
                    settings["nreactions"],
                    settings["max_offspring_portion"],
                    settings["writeout_threshold"],
@@ -354,7 +378,7 @@ function read_usersettings(path::String; ngenerations::Int64=-1, population_size
                    settings["objective_data_path"],
                    settings["match_objectivefunction_species"],
                    settings["enable_speciation"],
-                   settings["track_metadata"],
+                   settings["track_fitness"],
                    settings["average_fitness"],
                    settings["same_fitness_crossover"],
                    settings["same_fitness_percent_range"],
@@ -372,4 +396,12 @@ function writeout_settings(settings::Settings, filename::String)
     open(filename, "w") do f
         write(f, stringsettings)
     end
+end
+
+function generate_chemical_species_names(nspecies::Int64)
+    chemical_species_names = Vector{String}()
+    for i in 1:nspecies
+        push!(chemical_species_names, "S$i")
+    end
+    return chemical_species_names
 end
